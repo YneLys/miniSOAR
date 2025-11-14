@@ -1,0 +1,14 @@
+version: '3.8'
+
+services:
+  soar-api:
+    build: .
+    container_name: mini-soar
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./soar_database.db:/app/soar_database.db
+      - ./playbooks:/app/playbooks
+    environment:
+      - PYTHONUNBUFFERED=1
+    restart: unless-stopped
