@@ -2,11 +2,21 @@
 Playbook: Threat Intelligence
 Descrição: Verifica IPs contra bases de threat intelligence
 """
-import logging
 from datetime import datetime
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+from validators import validate_ip
+from logger import get_logger
+from exceptions import ThreatIntelError, IPValidationError
+from utils import retry_async, CircuitBreaker
+
+logger = get_logger(__name__)
+
+# Circuit breaker para APIs de threat intelligence
+threat_intel_circuit_breaker = CircuitBreaker(
+    name="threat_intel",
+    failure_threshold=5,
+    timeout_seconds=120
+)
 
 # Base simulada de IPs maliciosos conhecidos
 KNOWN_MALICIOUS_IPS = {
@@ -48,7 +58,7 @@ SUSPICIOUS_RANGES = [
 
 async def check_threat_intel(ip: str) -> dict:
     """
-    Verifica IP contra bases de threat intelligence
+    Verifica IP contra bases de threat intelligence com retry logic
     
     Args:
         ip: Endereço IP a ser verificado
@@ -57,7 +67,13 @@ async def check_threat_intel(ip: str) -> dict:
         dict com informações de threat intel
     """
     try:
-        logger.info(f"Verificando threat intelligence para IP: {ip}")
+        # Validar IP
+        try:
+            ip = validate_ip(ip)
+        except IPValidationError as e:
+            raise ThreatIntelError(f"IP inválido: {ip}", {"ip": ip})
+        
+        logger.info(f"Verificando threat intelligence para IP: {ip}", extra={"ip": ip})
         
         result = {
             "ip": ip,
@@ -93,10 +109,21 @@ async def check_threat_intel(ip: str) -> dict:
             logger.warning(f"IP {ip} está em range suspeito!")
             return result
         
-        # Simular verificação em APIs externas
-        # Em produção: integrar com AbuseIPDB, VirusTotal, OTX, etc.
-        external_check = await simulate_external_threat_check(ip)
-        result.update(external_check)
+        # Simular verificação em APIs externas com retry
+        async def _check_external():
+            return simulate_external_threat_check(ip)
+        
+        try:
+            external_check = await retry_async(
+                _check_external,
+                max_attempts=3,
+                delay=1.0,
+                circuit_breaker=threat_intel_circuit_breaker
+            )
+            result.update(external_check)
+        except Exception as e:
+            logger.warning(f"Erro ao verificar APIs externas (continuando): {e}", extra={"ip": ip})
+            # Continuar mesmo se falhar - já temos dados da base local
         
         if result["is_malicious"]:
             logger.warning(f"IP {ip} identificado como malicioso por fontes externas!")
@@ -105,13 +132,11 @@ async def check_threat_intel(ip: str) -> dict:
         
         return result
         
+    except ThreatIntelError:
+        raise
     except Exception as e:
-        logger.error(f"Erro ao verificar threat intel: {str(e)}")
-        return {
-            "ip": ip,
-            "error": str(e),
-            "is_malicious": False
-        }
+        logger.error(f"Erro ao verificar threat intel: {e}", extra={"ip": ip}, exc_info=True)
+        raise ThreatIntelError(f"Erro ao verificar threat intel: {str(e)}", {"ip": ip})
 
 def check_suspicious_range(ip: str) -> dict:
     """Verifica se IP está em range suspeito"""

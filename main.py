@@ -1,195 +1,177 @@
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+"""
+Mini SOAR System - API Principal
+Sistema de Security Orchestration, Automation and Response
+"""
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Request, status
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
-from typing import Optional, List
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
+from typing import Optional, List, Dict
 from datetime import datetime
-import sqlite3
-import json
-import os
-from pathlib import Path
+import traceback
 
-# Importar playbooks
+# Importar módulos do sistema
+from config import settings
+from logger import get_logger, setup_logging
+from database import db_manager
+from exceptions import (
+    SOARException, ValidationError, DatabaseError,
+    BlockIPError, AlertError, ThreatIntelError
+)
+from services.event_service import EventService
+from services.incident_service import IncidentService
+from services.automation_service import AutomationService
+from repositories import BlockedIPRepository, AlertRepository
 from playbooks.block_ip import block_ip_playbook
-from playbooks.alert_manager import send_alert_playbook
-from playbooks.threat_intel import check_threat_intel
+from middleware import LoggingMiddleware, RateLimitMiddleware, get_correlation_id
 
-app = FastAPI(title="Mini SOAR System", version="1.0.0")
+# Configurar logging
+setup_logging(
+    log_level=settings.LOG_LEVEL,
+    log_file=settings.LOG_FILE,
+    use_json=settings.LOG_JSON
+)
 
-# Configuração do banco de dados
-DB_PATH = "soar_database.db"
+logger = get_logger(__name__)
+
+# Criar aplicação FastAPI
+app = FastAPI(
+    title=settings.API_TITLE,
+    version=settings.API_VERSION,
+    description="Sistema SOAR para automação de resposta a incidentes de segurança"
+)
+
+# Configurar CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Em produção, especificar origens permitidas
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Adicionar middlewares customizados
+app.add_middleware(LoggingMiddleware)
+RateLimitMiddleware.setup_app(app)
+
+# Inicializar serviços
+event_service = EventService()
+incident_service = IncidentService()
+automation_service = AutomationService()
+blocked_ip_repo = BlockedIPRepository()
+alert_repo = AlertRepository()
+
 
 # Modelos Pydantic
 class SecurityEvent(BaseModel):
-    event_type: str
-    source_ip: str
-    destination_ip: Optional[str] = None
-    username: Optional[str] = None
-    severity: str  # low, medium, high, critical
-    description: str
-    timestamp: Optional[str] = None
+    """Modelo para evento de segurança"""
+    event_type: str = Field(..., description="Tipo do evento")
+    source_ip: str = Field(..., description="IP de origem")
+    destination_ip: Optional[str] = Field(None, description="IP de destino")
+    username: Optional[str] = Field(None, description="Nome de usuário")
+    severity: str = Field(..., description="Nível de severidade (low, medium, high, critical)")
+    description: str = Field(..., description="Descrição do evento")
+    timestamp: Optional[str] = Field(None, description="Timestamp do evento (ISO format)")
 
-class BlockedIP(BaseModel):
-    ip: str
-    reason: str
 
-class IncidentResponse(BaseModel):
-    incident_id: int
-    status: str
-    actions_taken: List[str]
-    timestamp: str
+class BlockedIPRequest(BaseModel):
+    """Modelo para requisição de bloqueio de IP"""
+    ip: str = Field(..., description="Endereço IP a ser bloqueado")
+    reason: str = Field(..., description="Motivo do bloqueio")
 
-# Inicializar banco de dados
-def init_db():
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    
-    # Tabela de eventos
-    c.execute('''CREATE TABLE IF NOT EXISTS events
-                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
-                  event_type TEXT,
-                  source_ip TEXT,
-                  destination_ip TEXT,
-                  username TEXT,
-                  severity TEXT,
-                  description TEXT,
-                  timestamp TEXT,
-                  processed INTEGER DEFAULT 0)''')
-    
-    # Tabela de IPs bloqueados
-    c.execute('''CREATE TABLE IF NOT EXISTS blocked_ips
-                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
-                  ip TEXT UNIQUE,
-                  reason TEXT,
-                  blocked_at TEXT,
-                  active INTEGER DEFAULT 1)''')
-    
-    # Tabela de incidentes
-    c.execute('''CREATE TABLE IF NOT EXISTS incidents
-                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
-                  event_id INTEGER,
-                  status TEXT,
-                  actions_taken TEXT,
-                  created_at TEXT,
-                  resolved_at TEXT)''')
-    
-    # Tabela de alertas
-    c.execute('''CREATE TABLE IF NOT EXISTS alerts
-                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
-                  incident_id INTEGER,
-                  alert_type TEXT,
-                  message TEXT,
-                  sent_at TEXT)''')
-    
-    conn.commit()
-    conn.close()
 
-# Função para processar evento automaticamente
-async def process_event_automation(event_id: int, event: SecurityEvent):
-    """
-    Motor de automação - decide quais playbooks executar baseado no evento
-    """
-    actions_taken = []
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    
-    # Criar incidente
-    incident_id = create_incident(event_id, "open")
-    
-    # Regra 1: Múltiplas falhas de login
-    if event.event_type == "failed_login":
-        c.execute("SELECT COUNT(*) FROM events WHERE source_ip = ? AND event_type = 'failed_login' AND datetime(timestamp) > datetime('now', '-5 minutes')", 
-                  (event.source_ip,))
-        count = c.fetchone()[0]
-        
-        if count >= 5:
-            # Executar playbook de bloqueio
-            result = await block_ip_playbook(event.source_ip, f"Multiple failed logins: {count} attempts")
-            actions_taken.append(f"Blocked IP {event.source_ip}")
-            
-            # Enviar alerta crítico
-            alert = await send_alert_playbook(
-                incident_id,
-                "critical",
-                f"IP {event.source_ip} blocked due to {count} failed login attempts"
-            )
-            actions_taken.append("Critical alert sent")
-    
-    # Regra 2: IPs suspeitos via Threat Intel
-    if event.severity in ["high", "critical"]:
-        threat_data = await check_threat_intel(event.source_ip)
-        if threat_data.get("is_malicious"):
-            result = await block_ip_playbook(event.source_ip, "Known malicious IP from threat intelligence")
-            actions_taken.append(f"Blocked malicious IP {event.source_ip}")
-            
-            alert = await send_alert_playbook(
-                incident_id,
-                "critical",
-                f"Known threat actor IP detected: {event.source_ip}"
-            )
-            actions_taken.append("Threat intelligence alert sent")
-    
-    # Regra 3: Eventos críticos sempre geram alerta
-    if event.severity == "critical":
-        alert = await send_alert_playbook(
-            incident_id,
-            "critical",
-            f"Critical event: {event.description}"
-        )
-        actions_taken.append("Critical event alert sent")
-    
-    # Atualizar incidente com ações tomadas
-    update_incident(incident_id, actions_taken)
-    
-    # Marcar evento como processado
-    c.execute("UPDATE events SET processed = 1 WHERE id = ?", (event_id,))
-    conn.commit()
-    conn.close()
-    
-    return {
-        "incident_id": incident_id,
-        "actions_taken": actions_taken
-    }
+class ErrorResponse(BaseModel):
+    """Modelo para respostas de erro"""
+    error: str
+    detail: Optional[str] = None
+    correlation_id: Optional[str] = None
 
-def create_incident(event_id: int, status: str) -> int:
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    timestamp = datetime.now().isoformat()
-    
-    c.execute("""INSERT INTO incidents (event_id, status, actions_taken, created_at)
-                 VALUES (?, ?, ?, ?)""",
-              (event_id, status, json.dumps([]), timestamp))
-    
-    incident_id = c.lastrowid
-    conn.commit()
-    conn.close()
-    return incident_id
 
-def update_incident(incident_id: int, actions: List[str]):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
+# Exception handlers
+@app.exception_handler(SOARException)
+async def soar_exception_handler(request: Request, exc: SOARException):
+    """Handler para exceções customizadas do SOAR"""
+    correlation_id = get_correlation_id(request)
+    logger.error(
+        f"SOAR Exception: {exc.message}",
+        extra={"correlation_id": correlation_id, "details": exc.details},
+        exc_info=True
+    )
     
-    c.execute("""UPDATE incidents 
-                 SET actions_taken = ?, status = 'processed'
-                 WHERE id = ?""",
-              (json.dumps(actions), incident_id))
+    return JSONResponse(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        content={
+            "error": exc.message,
+            "detail": exc.details,
+            "correlation_id": correlation_id
+        }
+    )
+
+
+@app.exception_handler(ValidationError)
+async def validation_exception_handler(request: Request, exc: ValidationError):
+    """Handler para erros de validação"""
+    correlation_id = get_correlation_id(request)
+    return JSONResponse(
+        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+        content={
+            "error": "Validation error",
+            "detail": exc.message,
+            "correlation_id": correlation_id
+        }
+    )
+
+
+@app.exception_handler(Exception)
+async def general_exception_handler(request: Request, exc: Exception):
+    """Handler para exceções genéricas"""
+    correlation_id = get_correlation_id(request)
+    logger.error(
+        f"Unexpected error: {str(exc)}",
+        extra={"correlation_id": correlation_id},
+        exc_info=True
+    )
     
-    conn.commit()
-    conn.close()
+    return JSONResponse(
+        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        content={
+            "error": "Internal server error",
+            "detail": str(exc) if settings.LOG_LEVEL == "DEBUG" else "An unexpected error occurred",
+            "correlation_id": correlation_id
+        }
+    )
 
-# Endpoints da API
 
+# Startup e Shutdown
 @app.on_event("startup")
 async def startup():
-    init_db()
-    # Criar diretório de playbooks se não existir
-    Path("playbooks").mkdir(exist_ok=True)
-    print("🚀 Mini SOAR System iniciado!")
+    """Inicialização da aplicação"""
+    try:
+        # Banco de dados já é inicializado automaticamente pelo db_manager
+        logger.info(
+            f"🚀 {settings.API_TITLE} v{settings.API_VERSION} iniciado!",
+            extra={"host": settings.API_HOST, "port": settings.API_PORT}
+        )
+    except Exception as e:
+        logger.error(f"Erro na inicialização: {e}", exc_info=True)
+        raise
 
-@app.get("/")
-async def root():
+
+@app.on_event("shutdown")
+async def shutdown():
+    """Finalização da aplicação"""
+    logger.info("Aplicação sendo encerrada...")
+
+
+# Endpoints
+@app.get("/", tags=["Root"])
+async def root(request: Request):
+    """Endpoint raiz com informações da API"""
+    correlation_id = get_correlation_id(request)
     return {
-        "message": "Mini SOAR System API",
-        "version": "1.0.0",
+        "message": f"{settings.API_TITLE} API",
+        "version": settings.API_VERSION,
+        "correlation_id": correlation_id,
         "endpoints": {
             "POST /events": "Receber eventos de segurança",
             "GET /events": "Listar eventos",
@@ -197,174 +179,324 @@ async def root():
             "GET /blocked-ips": "Listar IPs bloqueados",
             "POST /block-ip": "Bloquear IP manualmente",
             "GET /alerts": "Listar alertas",
-            "GET /stats": "Estatísticas do sistema"
+            "GET /stats": "Estatísticas do sistema",
+            "GET /health": "Health check",
+            "GET /metrics": "Métricas do sistema"
         }
     }
 
-@app.post("/events", status_code=201)
-async def receive_event(event: SecurityEvent, background_tasks: BackgroundTasks):
+
+@app.post("/events", status_code=status.HTTP_201_CREATED, tags=["Events"])
+async def receive_event(
+    event: SecurityEvent,
+    background_tasks: BackgroundTasks,
+    request: Request
+):
     """
     Endpoint para receber eventos de segurança (simulando SIEM)
+    O evento é processado automaticamente em background
     """
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
+    correlation_id = get_correlation_id(request)
     
-    timestamp = event.timestamp or datetime.now().isoformat()
-    
-    c.execute("""INSERT INTO events 
-                 (event_type, source_ip, destination_ip, username, severity, description, timestamp)
-                 VALUES (?, ?, ?, ?, ?, ?, ?)""",
-              (event.event_type, event.source_ip, event.destination_ip, 
-               event.username, event.severity, event.description, timestamp))
-    
-    event_id = c.lastrowid
-    conn.commit()
-    conn.close()
-    
-    # Processar automação em background
-    background_tasks.add_task(process_event_automation, event_id, event)
-    
-    return {
-        "status": "Event received",
-        "event_id": event_id,
-        "message": "Event is being processed by automation engine"
-    }
+    try:
+        logger.info(
+            f"Recebendo evento: {event.event_type}",
+            extra={
+                "correlation_id": correlation_id,
+                "event_type": event.event_type,
+                "source_ip": event.source_ip,
+                "severity": event.severity
+            }
+        )
+        
+        # Criar evento usando serviço
+        result = event_service.create_event(
+            event_type=event.event_type,
+            source_ip=event.source_ip,
+            destination_ip=event.destination_ip,
+            username=event.username,
+            severity=event.severity,
+            description=event.description,
+            timestamp=event.timestamp
+        )
+        
+        event_id = result["event_id"]
+        incident_id = result["incident_id"]
+        
+        # Processar automação em background
+        async def process_automation():
+            try:
+                event_data = {
+                    "event_type": event.event_type,
+                    "source_ip": event.source_ip,
+                    "destination_ip": event.destination_ip,
+                    "severity": event.severity,
+                    "description": event.description
+                }
+                await automation_service.process_event(event_id, event_data)
+            except Exception as e:
+                logger.error(
+                    f"Erro no processamento automático do evento {event_id}: {e}",
+                    extra={"event_id": event_id, "correlation_id": correlation_id},
+                    exc_info=True
+                )
+        
+        background_tasks.add_task(process_automation)
+        
+        return {
+            "status": "Event received",
+            "event_id": event_id,
+            "incident_id": incident_id,
+            "message": "Event is being processed by automation engine",
+            "correlation_id": correlation_id
+        }
+        
+    except ValidationError as e:
+        raise
+    except Exception as e:
+        logger.error(
+            f"Erro ao receber evento: {e}",
+            extra={"correlation_id": correlation_id},
+            exc_info=True
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Erro ao processar evento: {str(e)}"
+        )
 
-@app.get("/events")
-async def list_events(limit: int = 50):
-    """Listar eventos recentes"""
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    
-    c.execute("""SELECT * FROM events 
-                 ORDER BY timestamp DESC LIMIT ?""", (limit,))
-    
-    events = []
-    for row in c.fetchall():
-        events.append({
-            "id": row[0],
-            "event_type": row[1],
-            "source_ip": row[2],
-            "destination_ip": row[3],
-            "username": row[4],
-            "severity": row[5],
-            "description": row[6],
-            "timestamp": row[7],
-            "processed": bool(row[8])
-        })
-    
-    conn.close()
-    return {"events": events, "count": len(events)}
 
-@app.get("/incidents")
-async def list_incidents(limit: int = 50):
-    """Listar incidentes"""
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    
-    c.execute("""SELECT * FROM incidents 
-                 ORDER BY created_at DESC LIMIT ?""", (limit,))
-    
-    incidents = []
-    for row in c.fetchall():
-        incidents.append({
-            "id": row[0],
-            "event_id": row[1],
-            "status": row[2],
-            "actions_taken": json.loads(row[3]) if row[3] else [],
-            "created_at": row[4],
-            "resolved_at": row[5]
-        })
-    
-    conn.close()
-    return {"incidents": incidents, "count": len(incidents)}
+@app.get("/events", tags=["Events"])
+async def list_events(
+    limit: int = 50,
+    offset: int = 0,
+    processed: Optional[bool] = None,
+    severity: Optional[str] = None,
+    request: Request = None
+):
+    """Listar eventos recentes com filtros opcionais"""
+    try:
+        result = event_service.list_events(
+            limit=limit,
+            offset=offset,
+            processed=processed,
+            severity=severity
+        )
+        return result
+    except ValidationError as e:
+        raise
+    except Exception as e:
+        logger.error(f"Erro ao listar eventos: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=str(e)
+        )
 
-@app.get("/blocked-ips")
-async def list_blocked_ips():
+
+@app.get("/incidents", tags=["Incidents"])
+async def list_incidents(
+    limit: int = 50,
+    offset: int = 0,
+    status: Optional[str] = None
+):
+    """Listar incidentes com filtros opcionais"""
+    try:
+        return incident_service.list_incidents(
+            limit=limit,
+            offset=offset,
+            status=status
+        )
+    except ValidationError as e:
+        raise
+    except Exception as e:
+        logger.error(f"Erro ao listar incidentes: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=str(e)
+        )
+
+
+@app.get("/blocked-ips", tags=["Blocked IPs"])
+async def list_blocked_ips(active_only: bool = True, limit: int = 100):
     """Listar IPs bloqueados"""
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    
-    c.execute("SELECT * FROM blocked_ips WHERE active = 1 ORDER BY blocked_at DESC")
-    
-    blocked = []
-    for row in c.fetchall():
-        blocked.append({
-            "id": row[0],
-            "ip": row[1],
-            "reason": row[2],
-            "blocked_at": row[3]
-        })
-    
-    conn.close()
-    return {"blocked_ips": blocked, "count": len(blocked)}
+    try:
+        blocked_ips = blocked_ip_repo.list(active_only=active_only, limit=limit)
+        return {
+            "blocked_ips": blocked_ips,
+            "count": len(blocked_ips)
+        }
+    except Exception as e:
+        logger.error(f"Erro ao listar IPs bloqueados: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=str(e)
+        )
 
-@app.post("/block-ip")
-async def manual_block_ip(data: BlockedIP):
+
+@app.post("/block-ip", tags=["Blocked IPs"])
+async def manual_block_ip(data: BlockedIPRequest, request: Request):
     """Bloquear IP manualmente"""
-    result = await block_ip_playbook(data.ip, data.reason)
-    return result
+    correlation_id = get_correlation_id(request)
+    
+    try:
+        logger.info(
+            f"Bloqueio manual solicitado para IP: {data.ip}",
+            extra={"ip": data.ip, "correlation_id": correlation_id}
+        )
+        
+        result = await block_ip_playbook(data.ip, data.reason)
+        return result
+    except BlockIPError as e:
+        raise
+    except Exception as e:
+        logger.error(
+            f"Erro ao bloquear IP: {e}",
+            extra={"ip": data.ip, "correlation_id": correlation_id},
+            exc_info=True
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=str(e)
+        )
 
-@app.get("/alerts")
-async def list_alerts(limit: int = 50):
+
+@app.get("/alerts", tags=["Alerts"])
+async def list_alerts(
+    limit: int = 50,
+    offset: int = 0,
+    incident_id: Optional[int] = None,
+    alert_type: Optional[str] = None
+):
     """Listar alertas enviados"""
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    
-    c.execute("""SELECT * FROM alerts 
-                 ORDER BY sent_at DESC LIMIT ?""", (limit,))
-    
-    alerts = []
-    for row in c.fetchall():
-        alerts.append({
-            "id": row[0],
-            "incident_id": row[1],
-            "alert_type": row[2],
-            "message": row[3],
-            "sent_at": row[4]
-        })
-    
-    conn.close()
-    return {"alerts": alerts, "count": len(alerts)}
+    try:
+        alerts = alert_repo.list(
+            limit=limit,
+            offset=offset,
+            incident_id=incident_id,
+            alert_type=alert_type
+        )
+        return {
+            "alerts": alerts,
+            "count": len(alerts)
+        }
+    except Exception as e:
+        logger.error(f"Erro ao listar alertas: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=str(e)
+        )
 
-@app.get("/stats")
+
+@app.get("/stats", tags=["Statistics"])
 async def get_stats():
     """Estatísticas do sistema"""
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    
-    # Total de eventos
-    c.execute("SELECT COUNT(*) FROM events")
-    total_events = c.fetchone()[0]
-    
-    # Eventos por severidade
-    c.execute("""SELECT severity, COUNT(*) 
-                 FROM events 
-                 GROUP BY severity""")
-    severity_stats = dict(c.fetchall())
-    
-    # IPs bloqueados ativos
-    c.execute("SELECT COUNT(*) FROM blocked_ips WHERE active = 1")
-    blocked_ips = c.fetchone()[0]
-    
-    # Incidentes
-    c.execute("SELECT COUNT(*) FROM incidents")
-    total_incidents = c.fetchone()[0]
-    
-    # Alertas enviados
-    c.execute("SELECT COUNT(*) FROM alerts")
-    total_alerts = c.fetchone()[0]
-    
-    conn.close()
-    
-    return {
-        "total_events": total_events,
-        "severity_breakdown": severity_stats,
-        "active_blocked_ips": blocked_ips,
-        "total_incidents": total_incidents,
-        "total_alerts": total_alerts
-    }
+    try:
+        # Estatísticas de eventos
+        event_stats = event_service.get_statistics()
+        
+        # IPs bloqueados ativos
+        active_blocked = blocked_ip_repo.count_active()
+        
+        # Total de incidentes
+        from repositories import IncidentRepository
+        incident_repo = IncidentRepository()
+        total_incidents = incident_repo.count()
+        
+        # Total de alertas
+        total_alerts = alert_repo.count()
+        
+        return {
+            "total_events": event_stats.get("total_events", 0),
+            "severity_breakdown": event_stats.get("severity_breakdown", {}),
+            "active_blocked_ips": active_blocked,
+            "total_incidents": total_incidents,
+            "total_alerts": total_alerts,
+            "timestamp": datetime.now().isoformat()
+        }
+    except Exception as e:
+        logger.error(f"Erro ao obter estatísticas: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=str(e)
+        )
+
+
+@app.get("/health", tags=["Health"])
+async def health_check():
+    """Health check robusto do sistema"""
+    try:
+        health_status = {
+            "status": "healthy",
+            "timestamp": datetime.now().isoformat(),
+            "version": settings.API_VERSION,
+            "checks": {}
+        }
+        
+        # Verificar banco de dados
+        try:
+            with db_manager.get_connection() as conn:
+                conn.execute("SELECT 1")
+            health_status["checks"]["database"] = "ok"
+        except Exception as e:
+            health_status["checks"]["database"] = f"error: {str(e)}"
+            health_status["status"] = "degraded"
+        
+        # Verificar serviços
+        try:
+            # Testar repositórios
+            blocked_ip_repo.count_active()
+            health_status["checks"]["repositories"] = "ok"
+        except Exception as e:
+            health_status["checks"]["repositories"] = f"error: {str(e)}"
+            health_status["status"] = "degraded"
+        
+        status_code = status.HTTP_200_OK if health_status["status"] == "healthy" else status.HTTP_503_SERVICE_UNAVAILABLE
+        
+        return JSONResponse(
+            status_code=status_code,
+            content=health_status
+        )
+    except Exception as e:
+        logger.error(f"Erro no health check: {e}", exc_info=True)
+        return JSONResponse(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            content={
+                "status": "unhealthy",
+                "error": str(e),
+                "timestamp": datetime.now().isoformat()
+            }
+        )
+
+
+@app.get("/metrics", tags=["Metrics"])
+async def get_metrics():
+    """Métricas do sistema para monitoramento"""
+    try:
+        stats = await get_stats()
+        
+        # Adicionar métricas adicionais
+        metrics = {
+            **stats,
+            "system": {
+                "version": settings.API_VERSION,
+                "rate_limit_enabled": settings.RATE_LIMIT_ENABLED,
+                "threat_intel_enabled": settings.ENABLE_THREAT_INTEL
+            }
+        }
+        
+        return metrics
+    except Exception as e:
+        logger.error(f"Erro ao obter métricas: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=str(e)
+        )
+
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(
+        app,
+        host=settings.API_HOST,
+        port=settings.API_PORT,
+        log_level=settings.LOG_LEVEL.lower()
+    )

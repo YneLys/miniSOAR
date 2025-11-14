@@ -2,15 +2,21 @@
 Playbook: Gerenciador de Alertas
 Descrição: Envia alertas via diferentes canais (Email, Slack, SMS simulados)
 """
-import sqlite3
 from datetime import datetime
-import logging
-import json
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+from repositories import AlertRepository
+from validators import validate_severity
+from logger import get_logger
+from exceptions import AlertError, ValidationError
+from utils import retry_async, CircuitBreaker
+from config import ALERT_CHANNELS, EMAIL_RECIPIENTS, SLACK_CHANNELS, SMS_EMERGENCY_CONTACTS
 
-DB_PATH = "soar_database.db"
+logger = get_logger(__name__)
+
+# Circuit breakers por canal
+email_circuit_breaker = CircuitBreaker(name="email_alerts", failure_threshold=5, timeout_seconds=60)
+slack_circuit_breaker = CircuitBreaker(name="slack_alerts", failure_threshold=5, timeout_seconds=60)
+sms_circuit_breaker = CircuitBreaker(name="sms_alerts", failure_threshold=3, timeout_seconds=120)
 
 async def send_alert_playbook(incident_id: int, severity: str, message: str, channels: list = None) -> dict:
     """
@@ -28,14 +34,14 @@ async def send_alert_playbook(incident_id: int, severity: str, message: str, cha
     try:
         logger.info(f"Executando playbook: SEND ALERT - Severity: {severity}")
         
+        # Validar severidade
+        try:
+            severity = validate_severity(severity)
+        except ValidationError as e:
+            raise AlertError(f"Severidade inválida: {str(e)}")
+        
         if channels is None:
-            # Definir canais baseado na severidade
-            if severity == "critical":
-                channels = ["email", "slack", "sms"]
-            elif severity == "high":
-                channels = ["email", "slack"]
-            else:
-                channels = ["slack"]
+            channels = ALERT_CHANNELS.get(severity, ["slack"])
         
         results = {}
         
@@ -49,17 +55,19 @@ async def send_alert_playbook(incident_id: int, severity: str, message: str, cha
                 results["sms"] = await send_sms_alert(message, severity)
         
         # Registrar alerta no banco
-        conn = sqlite3.connect(DB_PATH)
-        c = conn.cursor()
-        
-        timestamp = datetime.now().isoformat()
-        c.execute("""INSERT INTO alerts (incident_id, alert_type, message, sent_at)
-                     VALUES (?, ?, ?, ?)""",
-                  (incident_id, severity, message, timestamp))
-        
-        alert_id = c.lastrowid
-        conn.commit()
-        conn.close()
+        try:
+            alert_repo = AlertRepository()
+            timestamp = datetime.now().isoformat()
+            alert_id = alert_repo.create(
+                incident_id=incident_id,
+                alert_type=severity,
+                message=message,
+                channel=",".join(channels) if channels else None
+            )
+        except Exception as e:
+            logger.error(f"Erro ao registrar alerta no banco: {e}", exc_info=True)
+            # Continuar mesmo se falhar o registro
+            alert_id = None
         
         logger.info(f"Alerta {alert_id} enviado com sucesso!")
         
@@ -71,84 +79,75 @@ async def send_alert_playbook(incident_id: int, severity: str, message: str, cha
             "timestamp": timestamp
         }
         
+    except AlertError:
+        raise
     except Exception as e:
-        logger.error(f"Erro ao enviar alerta: {str(e)}")
-        return {
-            "status": "error",
-            "message": str(e)
-        }
+        logger.error(f"Erro inesperado ao enviar alerta: {e}", exc_info=True)
+        raise AlertError(f"Erro ao enviar alerta: {str(e)}")
 
 async def send_email_alert(message: str, severity: str) -> dict:
     """
-    Simula envio de email
+    Simula envio de email com retry logic
     Em produção: integração com SendGrid, Amazon SES, etc.
     """
-    logger.info(f"Enviando email - Severity: {severity}")
+    async def _send():
+        logger.info(f"Enviando email - Severity: {severity}", extra={"severity": severity})
+        recipients = EMAIL_RECIPIENTS.get(severity, ["soc@company.com"])
     
-    # Definir destinatários baseado na severidade
-    recipients = {
-        "low": ["soc@company.com"],
-        "medium": ["soc@company.com", "security-team@company.com"],
-        "high": ["soc@company.com", "security-team@company.com", "manager@company.com"],
-        "critical": ["soc@company.com", "security-team@company.com", "manager@company.com", "ciso@company.com"]
-    }
+        email_data = {
+            "to": recipients,
+            "subject": f"[{severity.upper()}] Security Alert",
+            "body": message,
+            "timestamp": datetime.now().isoformat(),
+            "sent": True
+        }
+        logger.info(f"Email enviado para: {', '.join(recipients)}")
+        return email_data
     
-    email_data = {
-        "to": recipients.get(severity, ["soc@company.com"]),
-        "subject": f"[{severity.upper()}] Security Alert",
-        "body": message,
-        "timestamp": datetime.now().isoformat(),
-        "sent": True
-    }
-    
-    # Simular envio
-    logger.info(f"Email enviado para: {', '.join(email_data['to'])}")
-    
-    return email_data
+    try:
+        return await retry_async(_send, max_attempts=3, circuit_breaker=email_circuit_breaker)
+    except Exception as e:
+        logger.error(f"Erro ao enviar email: {e}", exc_info=True)
+        raise AlertError(f"Erro ao enviar email: {str(e)}")
 
 async def send_slack_alert(message: str, severity: str) -> dict:
     """
-    Simula envio para Slack
+    Simula envio para Slack com retry logic
     Em produção: usar slack_sdk ou webhooks
     """
-    logger.info(f"Enviando mensagem Slack - Severity: {severity}")
+    async def _send():
+        logger.info(f"Enviando mensagem Slack - Severity: {severity}", extra={"severity": severity})
+        channels = SLACK_CHANNELS.get(severity, ["#security-alerts"])
     
-    # Definir canais baseado na severidade
-    channels = {
-        "low": ["#security-alerts"],
-        "medium": ["#security-alerts"],
-        "high": ["#security-alerts", "#security-urgent"],
-        "critical": ["#security-alerts", "#security-urgent", "#incident-response"]
-    }
+        emoji_map = {
+            "low": "ℹ️",
+            "medium": "⚠️",
+            "high": "🚨",
+            "critical": "🔴"
+        }
+        
+        slack_message = {
+            "channels": channels,
+            "text": f"{emoji_map.get(severity, '🔔')} *[{severity.upper()}]* {message}",
+            "username": "SOAR Bot",
+            "icon_emoji": ":shield:",
+            "timestamp": datetime.now().isoformat(),
+            "sent": True
+        }
+        logger.info(f"Slack enviado para: {', '.join(channels)}")
+        return slack_message
     
-    # Emojis por severidade
-    emoji_map = {
-        "low": "ℹ️",
-        "medium": "⚠️",
-        "high": "🚨",
-        "critical": "🔴"
-    }
-    
-    slack_message = {
-        "channels": channels.get(severity, ["#security-alerts"]),
-        "text": f"{emoji_map.get(severity, '🔔')} *[{severity.upper()}]* {message}",
-        "username": "SOAR Bot",
-        "icon_emoji": ":shield:",
-        "timestamp": datetime.now().isoformat(),
-        "sent": True
-    }
-    
-    logger.info(f"Slack enviado para: {', '.join(slack_message['channels'])}")
-    
-    return slack_message
+    try:
+        return await retry_async(_send, max_attempts=3, circuit_breaker=slack_circuit_breaker)
+    except Exception as e:
+        logger.error(f"Erro ao enviar Slack: {e}", exc_info=True)
+        raise AlertError(f"Erro ao enviar Slack: {str(e)}")
 
 async def send_sms_alert(message: str, severity: str) -> dict:
     """
-    Simula envio de SMS
+    Simula envio de SMS com retry logic
     Em produção: integração com Twilio, AWS SNS, etc.
     """
-    logger.info(f"Enviando SMS - Severity: {severity}")
-    
     # SMS apenas para critical
     if severity != "critical":
         return {
@@ -156,22 +155,22 @@ async def send_sms_alert(message: str, severity: str) -> dict:
             "reason": "SMS only for critical alerts"
         }
     
-    # Números de emergência (simulados)
-    emergency_contacts = [
-        "+55-11-99999-1111",  # SOC Manager
-        "+55-11-99999-2222"   # CISO
-    ]
+    async def _send():
+        logger.info(f"Enviando SMS - Severity: {severity}", extra={"severity": severity})
+        sms_data = {
+            "to": SMS_EMERGENCY_CONTACTS,
+            "message": f"[CRITICAL ALERT] {message[:160]}",  # SMS limit
+            "timestamp": datetime.now().isoformat(),
+            "sent": True
+        }
+        logger.info(f"SMS enviado para: {', '.join(SMS_EMERGENCY_CONTACTS)}")
+        return sms_data
     
-    sms_data = {
-        "to": emergency_contacts,
-        "message": f"[CRITICAL ALERT] {message[:160]}",  # SMS limit
-        "timestamp": datetime.now().isoformat(),
-        "sent": True
-    }
-    
-    logger.info(f"SMS enviado para: {', '.join(sms_data['to'])}")
-    
-    return sms_data
+    try:
+        return await retry_async(_send, max_attempts=2, circuit_breaker=sms_circuit_breaker)
+    except Exception as e:
+        logger.error(f"Erro ao enviar SMS: {e}", exc_info=True)
+        raise AlertError(f"Erro ao enviar SMS: {str(e)}")
 
 async def create_ticket_playbook(incident_id: int, title: str, description: str, priority: str) -> dict:
     """
